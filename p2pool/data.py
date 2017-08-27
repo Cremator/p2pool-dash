@@ -130,6 +130,7 @@ class Share(object):
         
         new_transaction_hashes = []
         new_transaction_size = 0
+        all_transaction_size = 0
         transaction_hash_refs = []
         other_transaction_hashes = []
         
@@ -142,17 +143,23 @@ class Share(object):
         for tx_hash, fee in desired_other_transaction_hashes_and_fees:
             if tx_hash in tx_hash_to_this:
                 this = tx_hash_to_this[tx_hash]
+                if known_txs is not None:
+                    all_transaction_size += dash_data.tx_type.packed_size(known_txs[tx_hash])
             else:
                 if known_txs is not None:
                     this_size = dash_data.tx_type.packed_size(known_txs[tx_hash])
                     if new_transaction_size + this_size > 50000: # only allow 50 kB of new txns/share
                         break
                     new_transaction_size += this_size
+                    all_transaction_size += this_size
                 new_transaction_hashes.append(tx_hash)
                 this = [0, len(new_transaction_hashes)-1]
             transaction_hash_refs.extend(this)
             other_transaction_hashes.append(tx_hash)
         
+        if all_transaction_size: print "Generating a share with %i bytes (%i new) and %i transactions (%i new)" % \
+           (all_transaction_size, new_transaction_size, len(other_transaction_hashes)+len(new_transaction_hashes), len(new_transaction_hashes))
+
         included_transactions = set(other_transaction_hashes)
         removed_fees = [fee for tx_hash, fee in desired_other_transaction_hashes_and_fees if tx_hash not in included_transactions]
         definite_fees = sum(0 if fee is None else fee for tx_hash, fee in desired_other_transaction_hashes_and_fees if tx_hash in included_transactions)
@@ -162,11 +169,12 @@ class Share(object):
             assert base_subsidy is not None
             share_data = dict(share_data, subsidy=base_subsidy + definite_fees)
         
-        weights, total_weight, donation_weight = tracker.get_cumulative_weights(previous_share.share_data['previous_share_hash'] if previous_share is not None else None,
-            max(0, min(height, net.REAL_CHAIN_LENGTH) - 1),
-            65535*net.SPREAD*dash_data.target_to_average_attempts(block_target),
-        )
-        assert total_weight == sum(weights.itervalues()) + donation_weight, (total_weight, sum(weights.itervalues()) + donation_weight)
+        if previous_share is not None:
+          weights, total_weight, donation_weight = tracker.get_cumulative_weights(previous_share.share_data['previous_share_hash'] if previous_share is not None else None,
+              max(0, min(height, net.REAL_CHAIN_LENGTH) - 1),
+              65535*net.SPREAD*dash_data.target_to_average_attempts(block_target),
+          )
+          assert total_weight == sum(weights.itervalues()) + donation_weight, (total_weight, sum(weights.itervalues()) + donation_weight)
         
         worker_payout = share_data['subsidy']
         
@@ -180,9 +188,14 @@ class Share(object):
                     payments_tx += [dict(value=pm_payout, script=pm_script)]
                     worker_payout -= pm_payout
 
-        amounts = dict((script, worker_payout*(49*weight)//(50*total_weight)) for script, weight in weights.iteritems()) # 98% goes according to weights prior to this share
         this_script = dash_data.pubkey_hash_to_script2(share_data['pubkey_hash'])
-        amounts[this_script] = amounts.get(this_script, 0) + worker_payout//50 # 2% goes to block finder
+        if previous_share is not None:
+          amounts = dict((script, worker_payout*(49*weight)//(50*total_weight)) for script, weight in weights.iteritems()) # 98% goes according to weights prior to this share
+          amounts[this_script] = amounts.get(this_script, 0) + worker_payout//50 # 2% goes to block finder
+        else:
+          amounts = {this_script: worker_payout, DONATION_SCRIPT: 0}
+          #amounts[this_script] = worker_payout
+
         amounts[DONATION_SCRIPT] = amounts.get(DONATION_SCRIPT, 0) + worker_payout - sum(amounts.itervalues()) # all that's left over is the donation weight and some extra satoshis due to rounding
         
         if sum(amounts.itervalues()) != worker_payout or any(x < 0 for x in amounts.itervalues()):
@@ -198,15 +211,23 @@ class Share(object):
             far_share_hash=None if last is None and height < 99 else tracker.get_nth_parent_hash(share_data['previous_share_hash'], 99),
             max_bits=max_bits,
             bits=bits,
-            timestamp=math.clip(desired_timestamp, (
-                (previous_share.timestamp + net.SHARE_PERIOD) - (net.SHARE_PERIOD - 1), # = previous_share.timestamp + 1
-                (previous_share.timestamp + net.SHARE_PERIOD) + (net.SHARE_PERIOD - 1),
-            )) if previous_share is not None else desired_timestamp,
+            timestamp=max(desired_timestamp, (previous_share.timestamp + 1)) if previous_share is not None else desired_timestamp,
             new_transaction_hashes=new_transaction_hashes,
             transaction_hash_refs=transaction_hash_refs,
             absheight=((previous_share.absheight if previous_share is not None else 0) + 1) % 2**32,
             abswork=((previous_share.abswork if previous_share is not None else 0) + dash_data.target_to_average_attempts(bits.target)) % 2**128,
         )
+
+        if previous_share is not None:
+          if desired_timestamp > previous_share.timestamp + 180:
+              print "Warning: Previous share's timestamp is %i seconds old." % int(desired_timestamp - previous_share.timestamp)
+              print "Make sure your system clock is accurate, and ensure that you're connected to decent peers."
+              print "If your clock is more than 300 seconds behind, it can result in orphaned shares."
+              print "(It's also possible that this share is just taking a long time to mine.)"
+          if previous_share.timestamp > int(time.mktime(time.gmtime()) - time.mktime(time.gmtime(0))) + 3:
+              print "WARNING! Previous share's timestamp is %i seconds in the future. This is not normal." % \
+                     int(previous_share.timestamp - (int(time.mktime(time.gmtime()) - time.mktime(time.gmtime(0)))))
+              print "Make sure your system clock is accurate. Errors beyond 300 sec result in orphaned shares."
         
         gentx = dict(
             version=1,
@@ -315,6 +336,11 @@ class Share(object):
     
     def check(self, tracker):
         from p2pool import p2p
+
+        if self.timestamp > int(time.mktime(time.gmtime()) - time.mktime(time.gmtime(0))) + 300:
+            raise ValueError("Share timestamp is %i seconds in the future! Check your system clock." % \
+                self.timestamp - int(time.mktime(time.gmtime()) - time.mktime(time.gmtime(0))))
+
         if self.share_data['previous_share_hash'] is not None:
             previous_share = tracker.items[self.share_data['previous_share_hash']]
             if type(self) is type(previous_share):
